@@ -23,50 +23,31 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 
-#include <sys/stat.h>
-#include <sys/sysmacros.h>             /* For makedev() */
-
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 
-#include <assert.h>
-#include <errno.h>
+#include <err.h>
 
 /* libvncserver */
 #include "rfb/rfb.h"
 #include "rfb/keysym.h"
 
+//#define DEBUG
+
 /*****************************************************************************/
 
 static char FB_DEVICE[256] = "/dev/fb0";
 static struct fb_var_screeninfo scrinfo;
+static struct fb_fix_screeninfo fixscrinfo;
 static int fbfd = -1;
 static unsigned short int *fbmmap = MAP_FAILED;
 static unsigned short int *vncbuf;
-static unsigned short int *fbbuf;
 
 static int VNC_PORT = 5900;
 static rfbScreenInfoPtr vncscr;
 
-
-/* No idea, just copied from fbvncserver as part of the frame differerencing
- * algorithm.  I will probably be later rewriting all of this. */
-static struct varblock_t
-{
-	int min_i;
-	int min_j;
-	int max_i;
-	int max_j;
-	int r_offset;
-	int g_offset;
-	int b_offset;
-	int rfb_xres;
-	int rfb_maxy;
-} varblock;
-
 /*****************************************************************************/
-
 
 static void init_fb(void)
 {
@@ -74,62 +55,55 @@ static void init_fb(void)
 	size_t bytespp;
 
 	if ((fbfd = open(FB_DEVICE, O_RDONLY)) == -1)
-	{
-        fprintf(stderr, "cannot open fb device %s\n", FB_DEVICE);
-		exit(EXIT_FAILURE);
-	}
+            err(EXIT_FAILURE, "open %s", FB_DEVICE);
 
 	if (ioctl(fbfd, FBIOGET_VSCREENINFO, &scrinfo) != 0)
-	{
-        fprintf(stderr, "ioctl error\n");
-		exit(EXIT_FAILURE);
-	}
+            err(EXIT_FAILURE, "ioctl(FBIOGET_VSCREENINFO)");
 
-	pixels = scrinfo.xres * scrinfo.yres;
-	bytespp = scrinfo.bits_per_pixel / 8;
+	if (ioctl(fbfd, FBIOGET_FSCREENINFO, &fixscrinfo) != 0)
+            err(EXIT_FAILURE, "ioctl(FBIOGET_FSCREENINFO)");
 
+#ifdef DEBUG
 	fprintf(stderr, "xres=%d, yres=%d, xresv=%d, yresv=%d, xoffs=%d, yoffs=%d, bpp=%d\n",
 	  (int)scrinfo.xres, (int)scrinfo.yres,
 	  (int)scrinfo.xres_virtual, (int)scrinfo.yres_virtual,
 	  (int)scrinfo.xoffset, (int)scrinfo.yoffset,
 	  (int)scrinfo.bits_per_pixel);
 
-	fbmmap = mmap(NULL, pixels * bytespp, PROT_READ, MAP_SHARED, fbfd, 0);
+        fprintf(stderr, "line_length=%d\n",
+                (int)fixscrinfo.line_length);
+#endif
 
+	fbmmap = mmap(NULL, fixscrinfo.line_length * scrinfo.yres, PROT_READ, MAP_SHARED, fbfd, 0);
 	if (fbmmap == MAP_FAILED)
-	{
-        fprintf(stderr, "mmap failed\n");
-		exit(EXIT_FAILURE);
-	}
+            err(EXIT_FAILURE, "mmap");
 }
 
 static void cleanup_fb(void)
 {
-	if(fbfd != -1)
-	{
+	if (fbfd != -1) {
 		close(fbfd);
-	}
+                fbfd = -1;
+        }
 }
 
 /*****************************************************************************/
 
 static void init_fb_server(int argc, char **argv)
 {
+#ifdef DEBUG
     fprintf(stderr, "Initializing server...\n");
+#endif
 
 	/* Allocate the VNC server buffer to be managed (not manipulated) by
 	 * libvncserver. */
 	vncbuf = calloc(scrinfo.xres * scrinfo.yres, scrinfo.bits_per_pixel / 8);
-	assert(vncbuf != NULL);
+        if (vncbuf == NULL)
+            err(EXIT_FAILURE, "calloc");
 
-	/* Allocate the comparison buffer for detecting drawing updates from frame
-	 * to frame. */
-	fbbuf = calloc(scrinfo.xres * scrinfo.yres, scrinfo.bits_per_pixel / 8);
-	assert(fbbuf != NULL);
-
-	/* TODO: This assumes scrinfo.bits_per_pixel is 16. */
-	vncscr = rfbGetScreen(&argc, argv, scrinfo.xres, scrinfo.yres, 5, 2, (scrinfo.bits_per_pixel / 8));
-	assert(vncscr != NULL);
+	vncscr = rfbGetScreen(&argc, argv, scrinfo.xres, scrinfo.yres, 8, 3, (scrinfo.bits_per_pixel / 8));
+        if (vncscr == NULL)
+            errx(EXIT_FAILURE, "rfbGetScreen");
 
 	vncscr->desktopName = "framebuffer";
 	vncscr->frameBuffer = (char *)vncbuf;
@@ -144,90 +118,69 @@ static void init_fb_server(int argc, char **argv)
 
 	/* Mark as dirty since we haven't sent any updates at all yet. */
 	rfbMarkRectAsModified(vncscr, 0, 0, scrinfo.xres, scrinfo.yres);
-
-	/* No idea. */
-	varblock.r_offset = scrinfo.red.offset + scrinfo.red.length - 5;
-	varblock.g_offset = scrinfo.green.offset + scrinfo.green.length - 5;
-	varblock.b_offset = scrinfo.blue.offset + scrinfo.blue.length - 5;
-	varblock.rfb_xres = scrinfo.yres;
-	varblock.rfb_maxy = scrinfo.xres - 1;
 }
 
 /*****************************************************************************/
 
-#define PIXEL_FB_TO_RFB(p,r,g,b) ((p>>r)&0x1f001f)|(((p>>g)&0x1f001f)<<5)|(((p>>b)&0x1f001f)<<10)
-
 static void update_screen(void)
 {
-	unsigned int *f, *c, *r;
+	const unsigned int *f;
+        unsigned int *r;
 	int x, y;
 
-	varblock.min_i = varblock.min_j = 9999;
-	varblock.max_i = varblock.max_j = -1;
+        int min_i, min_j, max_i, max_j;
 
-	f = (unsigned int *)fbmmap;        /* -> framebuffer         */
-	c = (unsigned int *)fbbuf;         /* -> compare framebuffer */
+	min_i = min_j = 9999;
+	max_i = max_j = -1;
+
+	f = (const unsigned int *)fbmmap;        /* -> framebuffer         */
 	r = (unsigned int *)vncbuf;        /* -> remote framebuffer  */
 
-    int multiplier = 1;
-    if (scrinfo.bits_per_pixel == 32)
-    {
-        // HACK: support for 32 bit
-        multiplier = 2;
-    }
-    for (y = 0; y < scrinfo.yres * multiplier; y++)
+    for (y = 0; y < scrinfo.yres; y++)
 	{
-		/* Compare every 2 pixels at a time, assuming that changes are likely
-		 * in pairs. */
-		for (x = 0; x < scrinfo.xres; x += 2)
+		for (x = 0; x < scrinfo.xres; x++)
 		{
-			unsigned int pixel = *f;
+			unsigned int pixel = f[x];
+                        pixel = ((pixel & 0xff0000) >> 16) | (pixel & 0x00ff00) | ((pixel & 0xff) << 16);
 
-			if (pixel != *c)
+			if (pixel != r[x])
 			{
-				*c = pixel;
+				r[x] = pixel;
 
-				/* XXX: Undo the checkered pattern to test the efficiency
-				 * gain using hextile encoding. */
-				if (pixel == 0x18e320e4 || pixel == 0x20e418e3)
-					pixel = 0x18e318e3;
-
-				*r = PIXEL_FB_TO_RFB(pixel,
-				  varblock.r_offset, varblock.g_offset, varblock.b_offset);
-
-				if (x < varblock.min_i)
-					varblock.min_i = x;
+				if (x < min_i)
+					min_i = x;
 				else
 				{
-					if (x > varblock.max_i)
-						varblock.max_i = x;
+					if (x > max_i)
+						max_i = x;
 
-					if (y > varblock.max_j)
-						varblock.max_j = y;
-					else if (y < varblock.min_j)
-						varblock.min_j = y;
+					if (y > max_j)
+						max_j = y;
+					else if (y < min_j)
+						min_j = y;
 				}
 			}
-
-			f++, c++;
-			r++;
 		}
+                f += fixscrinfo.line_length / sizeof(unsigned int);
+                r += scrinfo.xres;
 	}
 
-	if (varblock.min_i < 9999)
+	if (min_i < 9999)
 	{
-		if (varblock.max_i < 0)
-			varblock.max_i = varblock.min_i;
+		if (max_i < 0)
+			max_i = min_i;
 
-		if (varblock.max_j < 0)
-			varblock.max_j = varblock.min_j;
+		if (max_j < 0)
+			max_j = min_j;
 
+#ifdef DEBUG
 		fprintf(stderr, "Dirty page: %dx%d+%d+%d...\n",
-		  (varblock.max_i+2) - varblock.min_i, (varblock.max_j+1) - varblock.min_j,
-		  varblock.min_i, varblock.min_j);
+		  (max_i+2) - min_i, (max_j+1) - min_j,
+		  min_i, min_j);
+#endif
 
-		rfbMarkRectAsModified(vncscr, varblock.min_i, varblock.min_j,
-		  varblock.max_i + 2, varblock.max_j + 1);
+		rfbMarkRectAsModified(vncscr, min_i, min_j,
+		  max_i + 2, max_j + 1);
 
 		rfbProcessEvents(vncscr, 10000);
 	}
