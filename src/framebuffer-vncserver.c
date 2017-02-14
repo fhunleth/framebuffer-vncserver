@@ -33,7 +33,7 @@
 #include "rfb/rfb.h"
 #include "rfb/keysym.h"
 
-//#define DEBUG
+#define DEBUG
 
 /*****************************************************************************/
 
@@ -41,8 +41,8 @@ static char FB_DEVICE[256] = "/dev/fb0";
 static struct fb_var_screeninfo scrinfo;
 static struct fb_fix_screeninfo fixscrinfo;
 static int fbfd = -1;
-static unsigned short int *fbmmap = MAP_FAILED;
-static unsigned short int *vncbuf;
+static const uint32_t *fbmmap = MAP_FAILED;
+static uint32_t *vncbuf = NULL;
 
 static int VNC_PORT = 5900;
 static rfbScreenInfoPtr vncscr;
@@ -84,6 +84,12 @@ static void cleanup_fb(void)
     }
 }
 
+static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl)
+{
+    fprintf(stderr, "Pointer: %d, %d, %d\n", x, y, buttonMask);
+    rfbDefaultPtrAddEvent(buttonMask, x, y, cl);
+}
+
 /*****************************************************************************/
 
 static void init_fb_server(int argc, char **argv)
@@ -109,7 +115,7 @@ static void init_fb_server(int argc, char **argv)
     vncscr->port = VNC_PORT;
 
     //	vncscr->kbdAddEvent = keyevent;
-    //	vncscr->ptrAddEvent = ptrevent;
+    vncscr->ptrAddEvent = ptrAddEvent;
 
     rfbInitServer(vncscr);
 
@@ -119,68 +125,82 @@ static void init_fb_server(int argc, char **argv)
 
 /*****************************************************************************/
 
-static void update_screen(void)
+static void update_rect(int left, int top, int right, int bottom, int offset, int skip)
 {
-    const unsigned int *f;
-    unsigned int *r;
-    int x, y;
+    int min_x = right + 1;
+    int min_y = bottom + 1;
+    int max_x = left - 1;
+    int max_y = top - 1;
 
-    int min_i, min_j, max_i, max_j;
+    const uint32_t *f = fbmmap + (top + offset) * (fixscrinfo.line_length / sizeof(uint32_t));
+    uint32_t *r = vncbuf + (top + offset) * scrinfo.xres;
 
-    min_i = min_j = 9999;
-    max_i = max_j = -1;
-
-    f = (const unsigned int *)fbmmap;        /* -> framebuffer         */
-    r = (unsigned int *)vncbuf;        /* -> remote framebuffer  */
-
-    for (y = 0; y < scrinfo.yres; y++)
-    {
-        for (x = 0; x < scrinfo.xres; x++)
-        {
-            unsigned int pixel = f[x];
+    for (int y = top + offset; y <= bottom; y += skip) {
+        for (int x = left + offset; x <= right; x += skip) {
+            uint32_t pixel = f[x];
             pixel = ((pixel & 0xff0000) >> 16) | (pixel & 0x00ff00) | ((pixel & 0xff) << 16);
 
-            if (pixel != r[x])
-            {
+            if (pixel != r[x]) {
                 r[x] = pixel;
 
-                if (x < min_i)
-                    min_i = x;
-                else
-                {
-                    if (x > max_i)
-                        max_i = x;
+                if (x < min_x)
+                    min_x = x;
+                if (x > max_x)
+                    max_x = x;
 
-                    if (y > max_j)
-                        max_j = y;
-                    else if (y < min_j)
-                        min_j = y;
-                }
+                if (y > max_y)
+                    max_y = y;
+                if (y < min_y)
+                    min_y = y;
             }
         }
-        f += fixscrinfo.line_length / sizeof(unsigned int);
-        r += scrinfo.xres;
+        f += skip * fixscrinfo.line_length / sizeof(uint32_t);
+        r += skip * scrinfo.xres;
     }
 
-    if (min_i < 9999)
-    {
-        if (max_i < 0)
-            max_i = min_i;
-
-        if (max_j < 0)
-            max_j = min_j;
-
+    if (min_x <= max_x) {
 #ifdef DEBUG
         fprintf(stderr, "Dirty page: %dx%d+%d+%d...\n",
-                (max_i+2) - min_i, (max_j+1) - min_j,
-                min_i, min_j);
+                (max_x+1) - min_x, (max_y+1) - min_y,
+                min_x, min_y);
 #endif
+        f = fbmmap + min_y * (fixscrinfo.line_length / sizeof(uint32_t));
+        r = vncbuf + min_y * scrinfo.xres;
+        for (int y = min_y; y <= max_y; y++) {
+            for (int x = min_x; x <= max_x; x++) {
+                uint32_t pixel = f[x];
+                r[x] = ((pixel & 0xff0000) >> 16) | (pixel & 0x00ff00) | ((pixel & 0xff) << 16);
+           }
+        }
+        rfbMarkRectAsModified(vncscr, min_x, min_y, max_x + 1, max_y + 1);
 
-        rfbMarkRectAsModified(vncscr, min_i, min_j,
-                              max_i + 2, max_j + 1);
-
-        rfbProcessEvents(vncscr, 10000);
+        if (skip > 1) {
+            /* If skipping, check the regions that we skipped. */
+            int outer_left = min_x - offset;
+            int outer_top = min_y - offset;
+            int outer_right = max_x + skip - offset - 1;
+            int outer_bottom = max_y + skip - offset - 1;
+            if (outer_right > right)
+                outer_right = right;
+            if (outer_bottom > bottom)
+                outer_bottom = bottom;
+            update_rect(outer_left, outer_top, outer_right, min_y - 1, 0, 1);
+            update_rect(outer_left, min_y, min_x - 1, max_y, 0, 1);
+            update_rect(max_x + 1, min_y, outer_right, max_y, 0, 1);
+            update_rect(outer_left, min_y + 1, outer_right, outer_bottom, 0, 1);
+        }
     }
+}
+
+static void update_screen()
+{
+    const int skip = 16;
+    static int offset = 0;
+
+    update_rect(0, 0, scrinfo.xres - 1, scrinfo.yres - 1, offset, skip);
+    offset++;
+    if (offset == skip)
+        offset = 0;
 }
 
 /*****************************************************************************/
@@ -192,6 +212,13 @@ void print_usage(char **argv)
                     "-f device: framebuffer device node, default is /dev/fb0\n"
                     "-h : print this help\n"
             , *argv);
+}
+
+static uint64_t getmicros()
+{
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    return tv.tv_sec * 1000000ULL + tv.tv_usec;
 }
 
 int main(int argc, char **argv)
@@ -234,13 +261,24 @@ int main(int argc, char **argv)
     init_fb_server(argc, argv);
 
     /* Implement our own event loop to detect changes in the framebuffer. */
+    uint64_t next_update = 0;
     while (1)
     {
         while (vncscr->clientHead == NULL)
             rfbProcessEvents(vncscr, 100000);
 
         rfbProcessEvents(vncscr, 100000);
-        update_screen();
+
+        uint64_t now = getmicros();
+        if (now > next_update) {
+            update_screen();
+
+            uint64_t update_time = getmicros() - now;
+            if (update_time > 10000)
+                fprintf(stderr, "update took %d us\n", update_time);
+
+            next_update = now + 100000; // Update 10 time/sec max
+        }
     }
 
     fprintf(stderr, "Cleaning up...\n");
