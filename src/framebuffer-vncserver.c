@@ -74,6 +74,15 @@ static void init_fb(void)
     fbmmap = mmap(NULL, fixscrinfo.line_length * scrinfo.yres, PROT_READ, MAP_SHARED, fbfd, 0);
     if (fbmmap == MAP_FAILED)
         err(EXIT_FAILURE, "mmap");
+
+    if (scrinfo.xres & 0x3) {
+        /* libvncserver complains when the xres is not divisible by 4. If
+         * the framebuffer has space (it might), pad it out.
+         */
+        int desired_xres = (scrinfo.xres + 3) & ~0x3;
+        if (desired_xres * scrinfo.bits_per_pixel / 8 < fixscrinfo.line_length)
+            scrinfo.xres = desired_xres;
+    }
 }
 
 static void cleanup_fb(void)
@@ -86,7 +95,9 @@ static void cleanup_fb(void)
 
 static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl)
 {
+#ifdef DEBUG
     fprintf(stderr, "Pointer: %d, %d, %d\n", x, y, buttonMask);
+#endif
     rfbDefaultPtrAddEvent(buttonMask, x, y, cl);
 }
 
@@ -108,6 +119,12 @@ static void init_fb_server(int argc, char **argv)
     if (vncscr == NULL)
         errx(EXIT_FAILURE, "rfbGetScreen");
 
+    /* We're running in ARGB so update the shifts so that we don't have to convert */
+    vncscr->serverFormat.redShift = 16;
+    vncscr->serverFormat.greenShift = 8;
+    vncscr->serverFormat.blueShift = 0;
+    vncscr->serverFormat.bigEndian = 0;
+
     vncscr->desktopName = "framebuffer";
     vncscr->frameBuffer = (char *)vncbuf;
     vncscr->alwaysShared = TRUE;
@@ -125,70 +142,115 @@ static void init_fb_server(int argc, char **argv)
 
 /*****************************************************************************/
 
-static void update_rect(int left, int top, int right, int bottom, int offset, int skip)
+struct rect {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+};
+
+static void union_rect(struct rect *r, const struct rect *other)
 {
-    int min_x = right + 1;
-    int min_y = bottom + 1;
-    int max_x = left - 1;
-    int max_y = top - 1;
+    if (other->x1 > other->x2)
+        return;
+
+    if (r->x1 > other->x1)
+        r->x1 = other->x1;
+    if (r->y1 > other->y1)
+        r->y1 = other->y1;
+    if (r->x2 < other->x2)
+        r->x2 = other->x2;
+    if (r->y2 < other->y2)
+        r->y2 = other->y2;
+}
+
+static inline void union_point(struct rect *r, int x, int y)
+{
+    if (x < r->x1)
+        r->x1 = x;
+    if (y < r->y1)
+        r->y1 = y;
+
+    if (x > r->x2)
+        r->x2 = x;
+    if (y > r->y2)
+        r->y2 = y;
+}
+
+static void print_rect(const char *caption, struct rect *r)
+{
+    if (r->x1 <= r->x2)
+        fprintf(stderr, "%s: %d,%d->%d,%d\n", caption, r->x1, r->y1, r->x2, r->y2);
+    else
+        fprintf(stderr, "%s: empty\n", caption);
+}
+
+static struct rect find_diff_rect(int left, int top, int right, int bottom, int offset, int skip)
+{
+    struct rect result;
+    result.x1 = INT_MAX;
+    result.y1 = INT_MAX;
+    result.x2 = -1;
+    result.y2 = -1;
 
     const uint32_t *f = fbmmap + (top + offset) * (fixscrinfo.line_length / sizeof(uint32_t));
     uint32_t *r = vncbuf + (top + offset) * scrinfo.xres;
-
     for (int y = top + offset; y <= bottom; y += skip) {
         for (int x = left + offset; x <= right; x += skip) {
-            uint32_t pixel = f[x];
-            pixel = ((pixel & 0xff0000) >> 16) | (pixel & 0x00ff00) | ((pixel & 0xff) << 16);
-
-            if (pixel != r[x]) {
-                r[x] = pixel;
-
-                if (x < min_x)
-                    min_x = x;
-                if (x > max_x)
-                    max_x = x;
-
-                if (y > max_y)
-                    max_y = y;
-                if (y < min_y)
-                    min_y = y;
-            }
+            if (f[x] != r[x])
+                union_point(&result, x, y);
         }
         f += skip * fixscrinfo.line_length / sizeof(uint32_t);
         r += skip * scrinfo.xres;
     }
 
-    if (min_x <= max_x) {
-#ifdef DEBUG
-        fprintf(stderr, "Dirty page: %dx%d+%d+%d...\n",
-                (max_x+1) - min_x, (max_y+1) - min_y,
-                min_x, min_y);
-#endif
-        f = fbmmap + min_y * (fixscrinfo.line_length / sizeof(uint32_t));
-        r = vncbuf + min_y * scrinfo.xres;
-        for (int y = min_y; y <= max_y; y++) {
-            for (int x = min_x; x <= max_x; x++) {
-                uint32_t pixel = f[x];
-                r[x] = ((pixel & 0xff0000) >> 16) | (pixel & 0x00ff00) | ((pixel & 0xff) << 16);
-           }
-        }
-        rfbMarkRectAsModified(vncscr, min_x, min_y, max_x + 1, max_y + 1);
-
+    if (result.x1 <= result.x2 && skip > 1) {
         if (skip > 1) {
             /* If skipping, check the regions that we skipped. */
-            int outer_left = min_x - offset;
-            int outer_top = min_y - offset;
-            int outer_right = max_x + skip - offset - 1;
-            int outer_bottom = max_y + skip - offset - 1;
+            int outer_left = result.x1 - offset;
+            int outer_top = result.y1 - offset;
+            int outer_right = result.x2 + skip - offset - 1;
+            int outer_bottom = result.y2 + skip - offset - 1;
             if (outer_right > right)
                 outer_right = right;
             if (outer_bottom > bottom)
                 outer_bottom = bottom;
-            update_rect(outer_left, outer_top, outer_right, min_y - 1, 0, 1);
-            update_rect(outer_left, min_y, min_x - 1, max_y, 0, 1);
-            update_rect(max_x + 1, min_y, outer_right, max_y, 0, 1);
-            update_rect(outer_left, min_y + 1, outer_right, outer_bottom, 0, 1);
+
+            struct rect r = find_diff_rect(outer_left, outer_top, outer_right, result.y1 - 1, 0, 1);
+            union_rect(&result, &r);
+            r = find_diff_rect(outer_left, result.y2 + 1, outer_right, outer_bottom, 0, 1);
+            union_rect(&result, &r);
+            r = find_diff_rect(outer_left, result.y1, result.x1 - 1, result.y2, 0, 1);
+            union_rect(&result, &r);
+            r = find_diff_rect(result.x2 + 1, result.y1, outer_right, result.y2, 0, 1);
+            union_rect(&result, &r);
         }
+    }
+    return result;
+}
+
+static void update_rect(int left, int top, int right, int bottom, int offset, int skip)
+{
+    struct rect delta = find_diff_rect(left, top, right, bottom, offset, skip);
+
+    if (delta.x1 <= delta.x2) {
+#ifdef DEBUG
+        fprintf(stderr, "Dirty page: %dx%d+%d+%d...\n",
+                (delta.x2+1) - delta.x1, (delta.y2+1) - delta.y1,
+                delta.x1, delta.y1);
+#endif
+        const uint32_t *f = fbmmap + delta.y1 * (fixscrinfo.line_length / sizeof(uint32_t));
+        uint32_t *r = vncbuf + delta.y1 * scrinfo.xres;
+        for (int y = delta.y1; y <= delta.y2; y++) {
+            for (int x = delta.x1; x <= delta.x2; x++)
+                r[x] = f[x];
+
+            f += fixscrinfo.line_length / sizeof(uint32_t);
+            r += scrinfo.xres;
+        }
+
+        /* rfbMarkRectAsModified wants non-inclusive x2, y2 */
+        rfbMarkRectAsModified(vncscr, delta.x1, delta.y1, delta.x2 + 1, delta.y2 + 1);
     }
 }
 
@@ -273,9 +335,11 @@ int main(int argc, char **argv)
         if (now > next_update) {
             update_screen();
 
+#ifdef DEBUG
             uint64_t update_time = getmicros() - now;
             if (update_time > 10000)
                 fprintf(stderr, "update took %d us\n", update_time);
+#endif
 
             next_update = now + 100000; // Update 10 time/sec max
         }
