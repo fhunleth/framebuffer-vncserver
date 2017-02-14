@@ -34,7 +34,7 @@
 #include "rfb/rfb.h"
 #include "rfb/keysym.h"
 
-#define DEBUG
+//#define DEBUG
 
 /*****************************************************************************/
 
