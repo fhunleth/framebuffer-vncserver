@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+#include <linux/uinput.h>
 
 #include <err.h>
 
@@ -43,11 +44,50 @@ static struct fb_fix_screeninfo fixscrinfo;
 static int fbfd = -1;
 static const uint32_t *fbmmap = MAP_FAILED;
 static uint32_t *vncbuf = NULL;
+static int uinputfd = -1;
 
 static int VNC_PORT = 5900;
 static rfbScreenInfoPtr vncscr;
 
 /*****************************************************************************/
+static void init_uinput()
+{
+    uinputfd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (uinputfd < 0)
+        errx(EXIT_FAILURE, "uinput kernel module required");
+
+    if (ioctl(uinputfd, UI_SET_EVBIT, EV_KEY) < 0)
+        err(EXIT_FAILURE, "ioctl(UI_SET_EVBIT)");
+    if (ioctl(uinputfd, UI_SET_KEYBIT, BTN_TOUCH) < 0)
+        err(EXIT_FAILURE, "ioctl(UI_SET_KEYBIT)");
+    if (ioctl(uinputfd, UI_SET_EVBIT, EV_ABS) < 0)
+        err(EXIT_FAILURE, "ioctl(UI_SET_EVBIT)");
+    if (ioctl(uinputfd, UI_SET_ABSBIT, ABS_X) < 0)
+        err(EXIT_FAILURE, "ioctl(UI_SET_ABSBIT)");
+    if (ioctl(uinputfd, UI_SET_ABSBIT, ABS_Y) < 0)
+        err(EXIT_FAILURE, "ioctl(UI_SET_ABSBIT)");
+
+    struct uinput_user_dev uidev;
+    memset(&uidev, 0, sizeof(uidev));
+    snprintf(uidev.name, UINPUT_MAX_NAME_SIZE, "framebuffer-vncserver");
+    uidev.id.bustype = BUS_USB;
+    uidev.id.vendor = 0x1;
+    uidev.id.product = 0x1;
+    uidev.id.version = 1;
+
+    uidev.absmin[ABS_X] = 0;
+    uidev.absmin[ABS_Y] = 0;
+    uidev.absmax[ABS_X] = scrinfo.xres - 1;
+    uidev.absmax[ABS_Y] = scrinfo.yres - 1;
+
+    if (write(uinputfd, &uidev, sizeof(uidev)) < 0)
+        err(EXIT_FAILURE, "write(uidev)");
+
+    if (ioctl(uinputfd, UI_DEV_CREATE) < 0)
+        err(EXIT_FAILURE, "ioctl(UI_DEV_CREATE)");
+
+    fprintf(stderr, "Initialized uinput\n");
+}
 
 static void init_fb(void)
 {
@@ -98,6 +138,31 @@ static void ptrAddEvent(int buttonMask, int x, int y, rfbClientPtr cl)
 #ifdef DEBUG
     fprintf(stderr, "Pointer: %d, %d, %d\n", x, y, buttonMask);
 #endif
+    if (buttonMask) {
+        struct input_event ev[6];
+        memset(&ev, 0, sizeof(ev));
+
+        ev[0].type = EV_KEY;
+        ev[0].code = BTN_TOUCH;
+        ev[0].value = 1;
+        ev[1].type = EV_ABS;
+        ev[1].code = ABS_X;
+        ev[1].value = x;
+        ev[2].type = EV_ABS;
+        ev[2].code = ABS_Y;
+        ev[2].value = y;
+        ev[3].type = EV_SYN;
+
+        ev[4].type = EV_KEY;
+        ev[4].code = BTN_TOUCH;
+        ev[4].value = 0;
+        ev[5].type = EV_SYN;
+
+        if (write(uinputfd, &ev, sizeof(ev)) < 0)
+            warn("error sending event");
+
+    }
+
     rfbDefaultPtrAddEvent(buttonMask, x, y, cl);
 }
 
@@ -314,6 +379,7 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "Initializing framebuffer device %s...\n", FB_DEVICE);
     init_fb();
+    init_uinput();
 
     fprintf(stderr, "Initializing VNC server:\n");
     fprintf(stderr, "	width:  %d\n", (int)scrinfo.xres);
