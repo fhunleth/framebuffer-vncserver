@@ -252,6 +252,7 @@ static void print_rect(const char *caption, struct rect *r)
 
 static struct rect find_diff_rect(int left, int top, int right, int bottom, int offset, int skip)
 {
+    int x, y;
     struct rect result;
     result.x1 = INT_MAX;
     result.y1 = INT_MAX;
@@ -260,8 +261,8 @@ static struct rect find_diff_rect(int left, int top, int right, int bottom, int 
 
     const uint32_t *f = fbmmap + (top + offset) * (fixscrinfo.line_length / sizeof(uint32_t));
     uint32_t *r = vncbuf + (top + offset) * scrinfo.xres;
-    for (int y = top + offset; y <= bottom; y += skip) {
-        for (int x = left + offset; x <= right; x += skip) {
+    for (y = top + offset; y <= bottom; y += skip) {
+        for (x = left + offset; x <= right; x += skip) {
             if (f[x] != r[x])
                 union_point(&result, x, y);
         }
@@ -296,6 +297,7 @@ static struct rect find_diff_rect(int left, int top, int right, int bottom, int 
 
 static void update_rect(int left, int top, int right, int bottom, int offset, int skip)
 {
+    int x, y;
     struct rect delta = find_diff_rect(left, top, right, bottom, offset, skip);
 
     if (delta.x1 <= delta.x2) {
@@ -306,8 +308,8 @@ static void update_rect(int left, int top, int right, int bottom, int offset, in
 #endif
         const uint32_t *f = fbmmap + delta.y1 * (fixscrinfo.line_length / sizeof(uint32_t));
         uint32_t *r = vncbuf + delta.y1 * scrinfo.xres;
-        for (int y = delta.y1; y <= delta.y2; y++) {
-            for (int x = delta.x1; x <= delta.x2; x++)
+        for (y = delta.y1; y <= delta.y2; y++) {
+            for (x = delta.x1; x <= delta.x2; x++)
                 r[x] = f[x];
 
             f += fixscrinfo.line_length / sizeof(uint32_t);
